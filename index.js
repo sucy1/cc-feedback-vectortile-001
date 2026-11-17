@@ -4,6 +4,33 @@ import Point from '@mapbox/point-geometry';
 /** @import {PbfReader} from 'pbf' */
 /** @import {Feature} from 'geojson' */
 
+/**
+ * @typedef {object} ToGeoJSONOptions
+ * @property {boolean} [validate] strictly validate the geometry command sequence and
+ * throw a {@link VectorTileError} (carrying `featureId`, `layer` and `reason`) instead of
+ * returning a partial result
+ * @property {boolean} [closeRings] automatically close polygon rings without duplicating
+ * the first point (default: `true`)
+ * @property {boolean} [normalizeWinding] rewind polygon rings so that outer rings wind
+ * counterclockwise and holes clockwise in tile coordinates
+ */
+
+/** Error thrown for invalid feature geometry when `validate` is enabled. */
+export class VectorTileError extends Error {
+    /**
+     * @param {string} reason
+     * @param {number | undefined} featureId
+     * @param {string | undefined} layer
+     */
+    constructor(reason, featureId, layer) {
+        super(`invalid vector tile geometry${layer ? ` in layer "${layer}"` : ''}${featureId != null ? ` for feature ${featureId}` : ''}: ${reason}`);
+        this.name = 'VectorTileError';
+        this.reason = reason;
+        this.featureId = featureId;
+        this.layer = layer;
+    }
+}
+
 export class VectorTileFeature {
     /**
      * @param {PbfReader} pbf
@@ -33,6 +60,8 @@ export class VectorTileFeature {
         this._keys = keys;
         /** @private */
         this._values = values;
+        /** @type {string | undefined} layer name, set internally by VectorTileLayer */
+        this._layer = undefined;
 
         while (pbf.pos < end) {
             const tag = pbf.readVarint();
@@ -53,7 +82,27 @@ export class VectorTileFeature {
     }
 
     loadGeometry() {
-        if (this._geometry < 0) throw new Error('feature has no geometry');
+        return this._readGeometry(false).lines;
+    }
+
+    bbox() {
+        return this._readGeometry(false).bbox;
+    }
+
+    /**
+     * Shared command-sequence parser for `loadGeometry`, `bbox` and `toGeoJSON`.
+     * With `validate` enabled, malformed command streams throw a `VectorTileError`
+     * instead of being silently skipped or misinterpreted.
+     *
+     * @private
+     * @param {boolean} validate
+     * @returns {{lines: Point[][], bbox: number[], closed: boolean[]}}
+     */
+    _readGeometry(validate) {
+        if (this._geometry < 0) {
+            if (validate) throw this._error('feature has no geometry');
+            throw new Error('feature has no geometry');
+        }
         const pbf = this._pbf;
         pbf.pos = this._geometry;
 
@@ -61,21 +110,58 @@ export class VectorTileFeature {
 
         /** @type Point[][] */
         const lines = [];
+        /** @type {boolean[]} whether each line was terminated by a ClosePath command */
+        const closed = [];
 
         /** @type Point[] | undefined */
         let line;
+        let lineClosed = false;
 
         let cmd = 1;
         let length = 0;
         let x = 0;
         let y = 0;
+        let x1 = Infinity,
+            x2 = -Infinity,
+            y1 = Infinity,
+            y2 = -Infinity;
+        let sawCommand = false;
+
+        /** @param {string} reason */
+        const fail = (reason) => { throw this._error(reason); };
+
+        /**
+         * @param {number} nx
+         * @param {number} ny
+         */
+        const checkRange = (nx, ny) => {
+            if (nx < 0 || nx > this.extent || ny < 0 || ny > this.extent) {
+                fail(`coordinate (${nx}, ${ny}) is outside the tile extent [0, ${this.extent}]`);
+            }
+        };
+
+        const finishLine = () => {
+            if (line) {
+                lines.push(line);
+                closed.push(lineClosed);
+                line = undefined;
+                lineClosed = false;
+            }
+        };
 
         while (pbf.pos < end) {
             if (length <= 0) {
                 const cmdLen = pbf.readVarint();
                 cmd = cmdLen & 0x7;
                 length = cmdLen >> 3;
-                if (length === 0) continue;
+                if (length === 0) {
+                    if (validate) fail('geometry command with a length of 0');
+                    continue;
+                }
+                sawCommand = true;
+                if (validate && cmd !== 1 && cmd !== 2 && cmd !== 7) {
+                    fail(`unknown command ${cmd}`);
+                }
             }
 
             length--;
@@ -83,83 +169,118 @@ export class VectorTileFeature {
             if (cmd === 1) { // moveTo
                 x += pbf.readSVarint();
                 y += pbf.readSVarint();
-                if (line) lines.push(line);
+                if (validate) checkRange(x, y);
+                if (x < x1) x1 = x;
+                if (x > x2) x2 = x;
+                if (y < y1) y1 = y;
+                if (y > y2) y2 = y;
+                finishLine();
                 line = [new Point(x, y)];
 
             } else if (cmd === 2) { // lineTo
+                if (!line) {
+                    if (validate) fail('LineTo command is not preceded by a MoveTo command');
+                    line = [];
+                }
                 x += pbf.readSVarint();
                 y += pbf.readSVarint();
-                if (line) line.push(new Point(x, y));
+                if (validate) checkRange(x, y);
+                if (x < x1) x1 = x;
+                if (x > x2) x2 = x;
+                if (y < y1) y1 = y;
+                if (y > y2) y2 = y;
+                line.push(new Point(x, y));
 
-            } else if (cmd === 7) {
-
-                // Workaround for https://github.com/mapbox/mapnik-vector-tile/issues/90
-                if (line) {
-                    line.push(line[0].clone()); // closePolygon
+            } else if (cmd === 7) { // closePath
+                if (!line) {
+                    if (validate) fail('ClosePath command is not preceded by a MoveTo command');
+                    continue;
                 }
+                lineClosed = true;
+                line.push(line[0].clone()); // closePolygon
 
             } else {
                 throw new Error(`unknown command ${cmd}`);
             }
         }
 
-        if (line) lines.push(line);
+        finishLine();
 
-        return lines;
-    }
-
-    bbox() {
-        if (this._geometry < 0) throw new Error('feature has no geometry');
-        const pbf = this._pbf;
-        pbf.pos = this._geometry;
-
-        const end = pbf.readVarint() + pbf.pos;
-        let cmd = 1,
-            length = 0,
-            x = 0,
-            y = 0,
-            x1 = Infinity,
-            x2 = -Infinity,
-            y1 = Infinity,
-            y2 = -Infinity;
-
-        while (pbf.pos < end) {
-            if (length <= 0) {
-                const cmdLen = pbf.readVarint();
-                cmd = cmdLen & 0x7;
-                length = cmdLen >> 3;
-                if (length === 0) continue;
-            }
-
-            length--;
-
-            if (cmd === 1 || cmd === 2) {
-                x += pbf.readSVarint();
-                y += pbf.readSVarint();
-                if (x < x1) x1 = x;
-                if (x > x2) x2 = x;
-                if (y < y1) y1 = y;
-                if (y > y2) y2 = y;
-
-            } else if (cmd !== 7) {
-                throw new Error(`unknown command ${cmd}`);
-            }
+        if (validate) {
+            if (!sawCommand) fail('empty geometry command sequence');
+            this._validateLines(lines, closed);
         }
 
-        return [x1, y1, x2, y2];
+        return {
+            lines,
+            closed,
+            bbox: [x1, y1, x2, y2]
+        };
+    }
+
+    /**
+     * Performs the type-specific structural checks that only make sense once the
+     * whole command stream has been read.
+     *
+     * @private
+     * @param {Point[][]} lines
+     * @param {boolean[]} closed
+     */
+    _validateLines(lines, closed) {
+        /** @param {string} reason */
+        const fail = (reason) => { throw this._error(reason); };
+
+        if (this.type === 1) { // Point
+            for (const line of lines) {
+                if (line.length !== 1) fail('Point geometry may only contain MoveTo commands with one point each');
+            }
+
+        } else if (this.type === 2) { // LineString
+            if (lines.length === 0) fail('LineString geometry contains no paths');
+            for (const line of lines) {
+                if (line.length < 2) fail('LineString path must contain at least two points');
+            }
+
+        } else if (this.type === 3) { // Polygon
+            if (lines.length === 0) fail('Polygon geometry contains no rings');
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (!closed[i]) fail('polygon ring is not terminated by a ClosePath command');
+                // The closing point duplicates the first one, so a valid ring has
+                // at least four coordinates / three distinct vertices.
+                if (line.length < 4) fail('polygon ring must contain at least three distinct points');
+                if (signedArea(line) === 0) fail('polygon ring has zero area');
+            }
+
+        } else {
+            fail(`unknown feature type ${this.type}`);
+        }
+    }
+
+    /**
+     * Builds a {@link VectorTileError} annotated with this feature's id and layer.
+     *
+     * @private
+     * @param {string} reason
+     * @returns {VectorTileError}
+     */
+    _error(reason) {
+        return new VectorTileError(reason, this.id, this._layer);
     }
 
     /**
      * @param {number} x
      * @param {number} y
      * @param {number} z
+     * @param {ToGeoJSONOptions} [options]
      * @return {Feature}
      */
-    toGeoJSON(x, y, z) {
+    toGeoJSON(x, y, z, options) {
+        const validate = !!options && !!options.validate;
         const size = this.extent * Math.pow(2, z),
             x0 = this.extent * x,
             y0 = this.extent * y,
-            vtCoords = this.loadGeometry();
+            parsed = this._readGeometry(validate);
 
         /** @param {Point} p */
         function projectPoint(p) {
@@ -179,7 +300,7 @@ export class VectorTileFeature {
 
         if (this.type === 1) {
             const points = [];
-            for (const line of vtCoords) {
+            for (const line of parsed.lines) {
                 points.push(line[0]);
             }
             const coordinates = projectLine(points);
@@ -189,22 +310,63 @@ export class VectorTileFeature {
 
         } else if (this.type === 2) {
 
-            const coordinates = vtCoords.map(projectLine);
+            const coordinates = parsed.lines.map(projectLine);
             geometry = coordinates.length === 1 ?
                 {type: 'LineString', coordinates: coordinates[0]} :
                 {type: 'MultiLineString', coordinates};
 
         } else if (this.type === 3) {
-            const polygons = classifyRings(vtCoords);
+            const closeRings = !options || options.closeRings !== false;
+            const normalizeWinding = !!options && !!options.normalizeWinding;
+
+            // Strip the synthetic closing point so rings can be re-closed at most
+            // once, never duplicating the first vertex.
+            const rings = parsed.lines.map((ring) => {
+                const result = ring.slice();
+                if (result.length > 1 && result[result.length - 1].equals(result[0])) {
+                    result.pop();
+                }
+                return result;
+            });
+
+            const polygons = classifyRings(rings);
+
+            if (validate) {
+                // A Polygon must have exactly one outer ring. In this library's
+                // signed-area convention outer rings are positive and holes
+                // negative, so a second positive ring means two outer rings
+                // were merged into one Polygon.
+                for (const polygon of polygons) {
+                    for (let i = 1; i < polygon.length; i++) {
+                        if (signedArea(polygon[i]) > 0) {
+                            throw this._error('two outer rings are merged into a single Polygon');
+                        }
+                    }
+                }
+            }
+
             const coordinates = [];
             for (const polygon of polygons) {
-                coordinates.push(polygon.map(projectLine));
+                coordinates.push(polygon.map((ring, ringIndex) => {
+                    const isOuter = ringIndex === 0;
+                    let result = ring;
+                    if (normalizeWinding) {
+                        // Outer rings wind counterclockwise (positive signed
+                        // area in tile coordinates) and holes clockwise.
+                        const area = signedArea(ring);
+                        const wantsPositive = isOuter;
+                        if ((area > 0) !== wantsPositive) result = ring.slice().reverse();
+                    }
+                    if (closeRings) result = result.concat([result[0]]);
+                    return projectLine(result);
+                }));
             }
             geometry = coordinates.length === 1 ?
                 {type: 'Polygon', coordinates: coordinates[0]} :
                 {type: 'MultiPolygon', coordinates};
         } else {
 
+            if (validate) throw this._error(`unknown feature type ${this.type}`);
             throw new Error('unknown feature type');
         }
 
@@ -320,7 +482,9 @@ export class VectorTileLayer {
         this._pbf.pos = this._features[i];
 
         const end = this._pbf.readVarint() + this._pbf.pos;
-        return new VectorTileFeature(this._pbf, end, this.extent, this._keys, this._values);
+        const feature = new VectorTileFeature(this._pbf, end, this.extent, this._keys, this._values);
+        feature._layer = this.name;
+        return feature;
     }
 }
 
